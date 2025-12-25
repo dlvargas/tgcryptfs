@@ -1,1 +1,26 @@
 /target
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.session
+telegramfs.session
+
+# Config with credentials
+config.json
+
+# Cache and data
+cache/
+*.db
+*.db-*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

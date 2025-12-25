@@ -5,7 +5,7 @@ edition = "2021"
 authors = ["TelegramFS Contributors"]
 description = "Encrypted filesystem backed by Telegram Saved Messages"
 license = "MIT"
-repository = "https://github.com/yourusername/telegramfs"
+repository = "https://github.com/damienheiser/telegramfs"
 keywords = ["filesystem", "fuse", "telegram", "encryption", "backup"]
 categories = ["filesystem", "cryptography"]
 
@@ -13,10 +13,10 @@ categories = ["filesystem", "cryptography"]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# Telegram client (TODO: implement with grammers when API stabilizes)
-# grammers-client = "0.8"
-# grammers-session = "0.8"
-# grammers-tl-types = "0.8"
+# Telegram client
+grammers-client = "0.6"
+grammers-session = "0.6"
+grammers-tl-types = "0.6"
 
 # FUSE filesystem
 fuser = "0.14"
