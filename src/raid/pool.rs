@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::telegram::TelegramBackend;
 
 use super::config::{AccountConfig, PoolConfig};
-use super::health::{AccountStatus, ArrayHealth, HealthTracker};
+use super::health::{AccountStatus, ArrayHealth, ArrayStatus, HealthTracker};
 use super::stripe::Stripe;
 
 /// Pool of Telegram account backends
@@ -31,37 +31,37 @@ impl AccountPool {
     /// Create a new account pool (does not connect)
     pub fn new(config: PoolConfig) -> Result<Self> {
         // Validate configuration
-        if config.accounts.is_empty() {
+        config.validate()?;
+
+        let enabled_accounts = config.enabled_accounts();
+        if enabled_accounts.is_empty() {
             return Err(Error::InvalidErasureConfig(
-                "At least one account is required".to_string(),
+                "At least one enabled account is required".to_string(),
             ));
         }
 
-        if config.accounts.len() > 255 {
+        if enabled_accounts.len() > 255 {
             return Err(Error::InvalidErasureConfig(
                 "Maximum 255 accounts supported".to_string(),
             ));
         }
 
-        // Create backends from account configs
-        let mut backends = Vec::with_capacity(config.accounts.len());
-        for account in &config.accounts {
-            let telegram_config = account.to_telegram_config();
+        // Create backends from enabled account configs
+        let mut backends = Vec::with_capacity(enabled_accounts.len());
+        for account in &enabled_accounts {
+            let telegram_config = Self::account_to_telegram_config(account);
             let backend = TelegramBackend::new(telegram_config);
             backends.push(Arc::new(backend));
         }
 
         // Create health tracker
         let account_count = backends.len();
-        let health = Arc::new(HealthTracker::new(
-            account_count,
-            config.data_chunks,
-            config.total_chunks,
-        ));
+        let required_accounts = config.erasure.data_chunks;
+        let health = Arc::new(HealthTracker::new(account_count, required_accounts));
 
         info!(
             "Created account pool with {} accounts (K={}, N={})",
-            account_count, config.data_chunks, config.total_chunks
+            account_count, config.erasure.data_chunks, config.erasure.total_chunks
         );
 
         Ok(Self {
@@ -69,6 +69,20 @@ impl AccountPool {
             health,
             config,
         })
+    }
+
+    /// Convert AccountConfig to TelegramConfig
+    fn account_to_telegram_config(account: &AccountConfig) -> TelegramConfig {
+        TelegramConfig {
+            api_id: account.api_id,
+            api_hash: account.api_hash.clone(),
+            phone: account.phone.clone(),
+            session_file: account.session_file.clone(),
+            max_concurrent_uploads: 3,
+            max_concurrent_downloads: 5,
+            retry_attempts: 3,
+            retry_base_delay_ms: 1000,
+        }
     }
 
     /// Connect all accounts in the pool
@@ -113,7 +127,7 @@ impl AccountPool {
         }
 
         // Check if we have enough connected accounts
-        let required = self.config.data_chunks as usize;
+        let required = self.config.erasure.data_chunks;
         if success_count < required {
             return Err(Error::ErasureFailed {
                 available: success_count,
@@ -184,24 +198,27 @@ impl AccountPool {
         }
 
         // Create upload futures for each block
+        let chunk_id = stripe.chunk_id.clone();
         let upload_futures: Vec<_> = all_blocks
             .into_iter()
             .map(|(block_idx, account_id, data)| {
                 let backend = self.get_backend(account_id);
                 let health = Arc::clone(&self.health);
-                let chunk_id = format!("{}_{}", stripe.stripe_id(), block_idx);
+                let block_chunk_id = format!("{}_{}", chunk_id, block_idx);
+                let data_owned = data.to_vec();
 
                 async move {
-                    // Check if this account is healthy
-                    if health.account_status(account_id) == AccountStatus::Failed {
+                    // Check if this account is unavailable
+                    let account_health = health.account_health(account_id);
+                    if account_health.status == AccountStatus::Unavailable {
                         warn!(
-                            "Skipping upload to failed account {} for block {}",
+                            "Skipping upload to unavailable account {} for block {}",
                             account_id, block_idx
                         );
                         return Err((
                             block_idx,
                             account_id,
-                            Error::AccountUnavailable(account_id, "Account marked as failed".to_string()),
+                            Error::AccountUnavailable(account_id, "Account marked as unavailable".to_string()),
                         ));
                     }
 
@@ -219,7 +236,7 @@ impl AccountPool {
                         }
                     };
 
-                    match backend.upload_chunk(&chunk_id, data).await {
+                    match backend.upload_chunk(&block_chunk_id, &data_owned).await {
                         Ok(msg_id) => {
                             health.record_success(account_id);
                             debug!(
@@ -244,11 +261,10 @@ impl AccountPool {
         let results = join_all(upload_futures).await;
 
         // Process results and build StripeInfo
-        let mut stripe_info = StripeInfo::new(
-            stripe.data_count(),
-            stripe.parity_count(),
-            stripe.block_size() as u64,
-        );
+        let data_count = stripe.data_count as u8;
+        let parity_count = stripe.parity_count() as u8;
+        let block_size = stripe.block_size() as u64;
+        let mut stripe_info = StripeInfo::new(data_count, parity_count, block_size);
 
         let mut success_count = 0;
         let mut failures = Vec::new();
@@ -288,7 +304,7 @@ impl AccountPool {
             .sort_by_key(|b| (b.block_index, b.account_id));
 
         // Check if we have enough successful uploads
-        let required = self.config.data_chunks as usize;
+        let required = self.config.erasure.data_chunks;
         if success_count < required {
             error!(
                 "Stripe upload failed: only {}/{} blocks uploaded, need at least {}",
@@ -352,9 +368,10 @@ impl AccountPool {
 
                 async move {
                     // Check if this account is healthy
-                    if health.account_status(account_id) == AccountStatus::Failed {
+                    let account_health = health.account_health(account_id);
+                    if account_health.status == AccountStatus::Unavailable {
                         warn!(
-                            "Attempting download from degraded account {} for block {}",
+                            "Attempting download from unavailable account {} for block {}",
                             account_id, block_idx
                         );
                     }
@@ -453,6 +470,11 @@ impl AccountPool {
         self.health.array_health()
     }
 
+    /// Get the array status (healthy, degraded, failed, rebuilding)
+    pub fn status(&self) -> ArrayStatus {
+        self.health.array_health().status
+    }
+
     /// Check if pool is degraded
     pub fn is_degraded(&self) -> bool {
         self.health.is_degraded()
@@ -484,37 +506,45 @@ impl AccountPool {
     }
 
     /// Get data chunk count (K)
-    pub fn data_chunks(&self) -> u8 {
-        self.config.data_chunks
+    pub fn data_chunks(&self) -> usize {
+        self.config.erasure.data_chunks
     }
 
     /// Get total chunk count (N)
-    pub fn total_chunks(&self) -> u8 {
-        self.config.total_chunks
+    pub fn total_chunks(&self) -> usize {
+        self.config.erasure.total_chunks
+    }
+
+    /// Get parity chunk count (N-K)
+    pub fn parity_chunks(&self) -> usize {
+        self.config.erasure.parity_chunks()
+    }
+
+    /// Get the health tracker
+    pub fn health_tracker(&self) -> &Arc<HealthTracker> {
+        &self.health
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::config::ErasureConfig;
     use std::path::PathBuf;
 
     fn make_test_config(count: usize) -> PoolConfig {
         let accounts: Vec<AccountConfig> = (0..count)
-            .map(|i| AccountConfig {
-                id: i as u8,
-                api_id: 12345,
-                api_hash: "test_hash".to_string(),
-                phone: Some(format!("+1234567890{}", i)),
-                session_file: PathBuf::from(format!("/tmp/test_session_{}", i)),
-            })
+            .map(|i| AccountConfig::new(
+                i as u8,
+                12345,
+                "test_hash".to_string(),
+                PathBuf::from(format!("/tmp/test_session_{}", i)),
+            ).with_phone(format!("+1234567890{}", i)))
             .collect();
 
-        PoolConfig {
-            accounts,
-            data_chunks: 3,
-            total_chunks: 5,
-        }
+        let erasure = ErasureConfig::new(3, 5);
+
+        PoolConfig::new(accounts, erasure)
     }
 
     #[test]
@@ -529,11 +559,26 @@ mod tests {
 
     #[test]
     fn test_pool_empty_accounts() {
-        let config = PoolConfig {
-            accounts: vec![],
-            data_chunks: 3,
-            total_chunks: 5,
-        };
+        let erasure = ErasureConfig::new(3, 5);
+        let config = PoolConfig::new(vec![], erasure);
+
+        let result = AccountPool::new(config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pool_not_enough_accounts() {
+        // Only 3 accounts but need N=5
+        let accounts: Vec<AccountConfig> = (0..3)
+            .map(|i| AccountConfig::new(
+                i as u8,
+                12345,
+                "test_hash".to_string(),
+                PathBuf::from(format!("/tmp/test_session_{}", i)),
+            ))
+            .collect();
+        let erasure = ErasureConfig::new(3, 5);
+        let config = PoolConfig::new(accounts, erasure);
 
         let result = AccountPool::new(config);
         assert!(result.is_err());
@@ -541,12 +586,34 @@ mod tests {
 
     #[test]
     fn test_get_backend() {
-        let config = make_test_config(3);
+        let config = make_test_config(5);
         let pool = AccountPool::new(config).unwrap();
 
         assert!(pool.get_backend(0).is_some());
         assert!(pool.get_backend(1).is_some());
         assert!(pool.get_backend(2).is_some());
-        assert!(pool.get_backend(3).is_none());
+        assert!(pool.get_backend(3).is_some());
+        assert!(pool.get_backend(4).is_some());
+        assert!(pool.get_backend(5).is_none());
+    }
+
+    #[test]
+    fn test_pool_health_methods() {
+        let config = make_test_config(5);
+        let pool = AccountPool::new(config).unwrap();
+
+        // Initially all accounts should be healthy
+        assert!(pool.can_operate());
+        assert!(!pool.is_degraded());
+        assert_eq!(pool.healthy_count(), 5);
+        assert_eq!(pool.healthy_accounts().len(), 5);
+    }
+
+    #[test]
+    fn test_pool_parity_chunks() {
+        let config = make_test_config(5);
+        let pool = AccountPool::new(config).unwrap();
+
+        assert_eq!(pool.parity_chunks(), 2); // N=5, K=3, parity=2
     }
 }
