@@ -42,17 +42,27 @@ log_error() {
 
 # Check if mount is active
 is_mounted() {
-    mount | grep -q "tgcryptfs on $MOUNT_POINT"
+    # Check both mount output and actual filesystem access
+    # Use full path to mount command since launchd has limited PATH
+    if /sbin/mount | grep -q "tgcryptfs on $MOUNT_POINT"; then
+        # Verify it's actually accessible
+        if timeout 5 ls "$MOUNT_POINT" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # Mount tgcryptfs if not mounted
 ensure_mounted() {
+    log_info "Checking if tgcryptfs is mounted at $MOUNT_POINT..."
+
     if is_mounted; then
         log_info "tgcryptfs already mounted at $MOUNT_POINT"
         return 0
     fi
 
-    log_info "Mounting tgcryptfs at $MOUNT_POINT"
+    log_info "Mount not detected, attempting to mount at $MOUNT_POINT"
     if [[ ! -f "$PASSWORD_FILE" ]]; then
         log_error "Password file not found: $PASSWORD_FILE"
         return 1
