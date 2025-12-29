@@ -12,6 +12,9 @@ pub struct OverlayConfig {
     /// Path to the upper (writable) layer
     pub upper_path: PathBuf,
 
+    /// Path to data directory (for databases)
+    pub data_dir: PathBuf,
+
     /// Path to whiteout database
     pub whiteout_db_path: PathBuf,
 
@@ -53,6 +56,7 @@ impl Default for OverlayConfig {
         OverlayConfig {
             lower_path: home,
             upper_path: data_dir.join("overlay_upper"),
+            data_dir: data_dir.clone(),
             whiteout_db_path: data_dir.join("overlay_whiteout.db"),
             conflict_behavior: ConflictBehavior::UpperWins,
             follow_symlinks: true,

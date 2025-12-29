@@ -5,9 +5,9 @@
 
 use fuser::{
     Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
 };
-use libc::{ENOENT, ENOTDIR, ENOTEMPTY};
+use libc::{ENOATTR, ENOENT, ENOTDIR, ENOTEMPTY};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -24,6 +24,8 @@ use super::{
     OverlayConfig,
 };
 
+use crate::metadata::{HardLinkStore, XattrStore};
+
 const TTL: Duration = Duration::from_secs(1);
 
 /// Overlay FUSE filesystem
@@ -36,6 +38,10 @@ pub struct OverlayFs {
     upper_path: PathBuf,
     /// Whiteout tracking
     whiteouts: WhiteoutStore,
+    /// Extended attributes storage
+    xattrs: XattrStore,
+    /// Hard link tracking for Time Machine support
+    hardlinks: HardLinkStore,
     /// Virtual inode management
     inodes: OverlayInodeManager,
     /// File handle manager
@@ -54,6 +60,22 @@ impl OverlayFs {
         let lower = LowerLayer::new(config.lower_path.clone(), config.clone())?;
         let whiteouts = WhiteoutStore::open(&config.whiteout_db_path)?;
 
+        // Initialize xattr store
+        let xattr_db_path = config.data_dir.join("overlay_xattr.db");
+        let xattrs = XattrStore::open(&xattr_db_path)
+            .map_err(|e| crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to open xattr store: {}", e)
+            )))?;
+
+        // Initialize hard link store for Time Machine support
+        let hardlink_db_path = config.data_dir.join("overlay_hardlinks.db");
+        let hardlinks = HardLinkStore::open(&hardlink_db_path)
+            .map_err(|e| crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to open hardlink store: {}", e)
+            )))?;
+
         // Create upper directory if it doesn't exist
         fs::create_dir_all(&config.upper_path)?;
 
@@ -67,6 +89,8 @@ impl OverlayFs {
             config,
             lower,
             whiteouts,
+            xattrs,
+            hardlinks,
             inodes: OverlayInodeManager::new(),
             handles: OverlayHandleManager::new(),
             uid: unsafe { libc::getuid() },
@@ -819,6 +843,9 @@ impl Filesystem for OverlayFs {
 
         let virtual_path = parent_inode.path.join(name);
 
+        // Get inode before removing to clean up xattrs
+        let ino = self.inodes.get_by_path(&virtual_path).map(|i| i.ino);
+
         // Check if exists in upper
         let upper_path = self.upper_path_for(&virtual_path);
         if upper_path.exists() {
@@ -836,10 +863,134 @@ impl Filesystem for OverlayFs {
             }
         }
 
+        // Remove xattrs if we had an inode
+        if let Some(ino) = ino {
+            if let Err(e) = self.xattrs.remove_all(ino) {
+                warn!("Failed to remove xattrs for deleted file: {}", e);
+            }
+        }
+
         // Remove from inode cache
         self.inodes.invalidate_path(&virtual_path);
 
         reply.ok();
+    }
+
+    fn link(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        debug!(
+            "link(ino={}, newparent={}, newname={:?})",
+            ino, newparent, newname
+        );
+
+        // Get source inode
+        let source_inode = match self.inodes.get(ino) {
+            Some(i) => i,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        // Can only hard link regular files
+        if source_inode.file_type != OverlayFileType::RegularFile {
+            reply.error(libc::EPERM);
+            return;
+        }
+
+        // Get parent inode
+        let parent_inode = match self.inodes.get(newparent) {
+            Some(i) => i,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        if parent_inode.file_type != OverlayFileType::Directory {
+            reply.error(ENOTDIR);
+            return;
+        }
+
+        // Build the new path
+        let new_virtual_path = parent_inode.path.join(newname);
+
+        // Check if new path already exists
+        if self.inodes.get_by_path(&new_virtual_path).is_some() {
+            reply.error(libc::EEXIST);
+            return;
+        }
+
+        // Copy-up source if in lower layer
+        let source_upper_path = if source_inode.source == InodeSource::Lower {
+            match self.copy_up(&source_inode.path) {
+                Ok(path) => path,
+                Err(e) => {
+                    error!("Copy-up failed for hard link source: {}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            }
+        } else {
+            self.upper_path_for(&source_inode.path)
+        };
+
+        // Create the hard link in upper layer
+        let new_upper_path = self.upper_path_for(&new_virtual_path);
+
+        // Ensure parent directory exists in upper
+        if let Some(parent_dir) = new_upper_path.parent() {
+            if let Err(e) = fs::create_dir_all(parent_dir) {
+                error!("Failed to create parent directory for hard link: {}", e);
+                reply.error(libc::EIO);
+                return;
+            }
+        }
+
+        // Create the hard link
+        if let Err(e) = fs::hard_link(&source_upper_path, &new_upper_path) {
+            error!("Failed to create hard link: {}", e);
+            reply.error(libc::EIO);
+            return;
+        }
+
+        // Track in hardlinks store
+        if let Err(e) = self.hardlinks.create_link(ino, &new_virtual_path) {
+            warn!("Failed to track hard link in store: {}", e);
+            // Continue anyway - the hard link is created
+        }
+
+        // Register the new path as a new inode pointing to same underlying file
+        let mut new_inode = source_inode.clone();
+        new_inode.path = new_virtual_path;
+        new_inode.source = InodeSource::Upper;
+        new_inode.lower_path = None;
+        let new_ino = self.inodes.register(new_inode.clone());
+
+        // Update the inode number for tracking
+        new_inode.ino = new_ino;
+
+        // Increment nlink in the returned attributes
+        let mut attr = new_inode.to_fuser_attr();
+        let link_count = self.hardlinks.get_link_count(ino);
+        if link_count > 1 {
+            attr.nlink = link_count as u32;
+        }
+
+        debug!(
+            "Created hard link: {} -> {} (nlink={})",
+            source_inode.path.display(),
+            new_inode.path.display(),
+            attr.nlink
+        );
+
+        reply.entry(&TTL, &attr, 0);
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -854,6 +1005,9 @@ impl Filesystem for OverlayFs {
         };
 
         let virtual_path = parent_inode.path.join(name);
+
+        // Get inode before removing to clean up xattrs
+        let ino = self.inodes.get_by_path(&virtual_path).map(|i| i.ino);
 
         // Check if exists in upper
         let upper_path = self.upper_path_for(&virtual_path);
@@ -877,6 +1031,13 @@ impl Filesystem for OverlayFs {
             // Mark as opaque to hide all lower contents
             if let Err(e) = self.whiteouts.mark_opaque(&virtual_path) {
                 error!("Failed to mark opaque: {}", e);
+            }
+        }
+
+        // Remove xattrs if we had an inode
+        if let Some(ino) = ino {
+            if let Err(e) = self.xattrs.remove_all(ino) {
+                warn!("Failed to remove xattrs for deleted directory: {}", e);
             }
         }
 
@@ -1126,5 +1287,199 @@ impl Filesystem for OverlayFs {
     ) {
         debug!("fsync(ino={}, fh={}, datasync={})", ino, fh, datasync);
         reply.ok();
+    }
+
+    fn setxattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        name: &OsStr,
+        value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        debug!(
+            "setxattr(ino={}, name={:?}, size={})",
+            ino,
+            name,
+            value.len()
+        );
+
+        let inode = match self.inodes.get(ino) {
+            Some(i) => i,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        // Copy-up if in lower layer
+        if inode.source == InodeSource::Lower {
+            match self.copy_up(&inode.path) {
+                Ok(_) => {
+                    // Update inode to point to upper
+                    let mut updated = inode.clone();
+                    updated.source = InodeSource::Upper;
+                    updated.lower_path = None;
+                    self.inodes.update(ino, updated);
+                }
+                Err(e) => {
+                    error!("Copy-up failed for setxattr: {}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            }
+        }
+
+        // Convert OsStr to string
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Invalid xattr name (not UTF-8)");
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        // Store xattr
+        match self.xattrs.set(ino, name_str, value) {
+            Ok(_) => reply.ok(),
+            Err(e) => {
+                error!("Failed to set xattr: {}", e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn getxattr(&mut self, _req: &Request, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+        debug!("getxattr(ino={}, name={:?}, size={})", ino, name, size);
+
+        if !self.inodes.exists(ino) {
+            reply.error(ENOENT);
+            return;
+        }
+
+        // Convert OsStr to string
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Invalid xattr name (not UTF-8)");
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        match self.xattrs.get(ino, name_str) {
+            Ok(Some(value)) => {
+                if size == 0 {
+                    // Query for size
+                    reply.size(value.len() as u32);
+                } else if size < value.len() as u32 {
+                    // Buffer too small
+                    reply.error(libc::ERANGE);
+                } else {
+                    // Return value
+                    reply.data(&value);
+                }
+            }
+            Ok(None) => {
+                reply.error(ENOATTR);
+            }
+            Err(e) => {
+                error!("Failed to get xattr: {}", e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request, ino: u64, size: u32, reply: ReplyXattr) {
+        debug!("listxattr(ino={}, size={})", ino, size);
+
+        if !self.inodes.exists(ino) {
+            reply.error(ENOENT);
+            return;
+        }
+
+        match self.xattrs.list(ino) {
+            Ok(names) => {
+                // Build null-terminated list
+                let mut buffer = Vec::new();
+                for name in names {
+                    buffer.extend_from_slice(name.as_bytes());
+                    buffer.push(0); // null terminator
+                }
+
+                if size == 0 {
+                    // Query for size
+                    reply.size(buffer.len() as u32);
+                } else if size < buffer.len() as u32 {
+                    // Buffer too small
+                    reply.error(libc::ERANGE);
+                } else {
+                    // Return list
+                    reply.data(&buffer);
+                }
+            }
+            Err(e) => {
+                error!("Failed to list xattrs: {}", e);
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    fn removexattr(&mut self, _req: &Request, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        debug!("removexattr(ino={}, name={:?})", ino, name);
+
+        let inode = match self.inodes.get(ino) {
+            Some(i) => i,
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        };
+
+        // Copy-up if in lower layer
+        if inode.source == InodeSource::Lower {
+            match self.copy_up(&inode.path) {
+                Ok(_) => {
+                    // Update inode to point to upper
+                    let mut updated = inode.clone();
+                    updated.source = InodeSource::Upper;
+                    updated.lower_path = None;
+                    self.inodes.update(ino, updated);
+                }
+                Err(e) => {
+                    error!("Copy-up failed for removexattr: {}", e);
+                    reply.error(libc::EIO);
+                    return;
+                }
+            }
+        }
+
+        // Convert OsStr to string
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => {
+                error!("Invalid xattr name (not UTF-8)");
+                reply.error(libc::EINVAL);
+                return;
+            }
+        };
+
+        // Remove xattr
+        match self.xattrs.remove(ino, name_str) {
+            Ok(_) => reply.ok(),
+            Err(e) => {
+                // Check if it's a "not found" error by trying to get it first
+                match self.xattrs.get(ino, name_str) {
+                    Ok(None) => reply.error(ENOATTR),
+                    _ => {
+                        error!("Failed to remove xattr: {}", e);
+                        reply.error(libc::EIO);
+                    }
+                }
+            }
+        }
     }
 }

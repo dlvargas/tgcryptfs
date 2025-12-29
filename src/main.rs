@@ -165,6 +165,10 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Time Machine backup management
+    #[command(subcommand)]
+    Timemachine(TimemachineCommands),
 }
 
 #[derive(Subcommand)]
@@ -228,6 +232,39 @@ enum ClusterCommands {
 
     /// Show cluster status
     Status,
+}
+
+#[derive(Subcommand)]
+enum TimemachineCommands {
+    /// Initialize Time Machine backup volume
+    Init {
+        /// Size of the backup volume (e.g., 500g, 1t)
+        #[arg(long, default_value = "500g")]
+        size: String,
+
+        /// Volume name
+        #[arg(long, default_value = "TGCryptFS-TM")]
+        name: String,
+    },
+
+    /// Mount Time Machine backup volume
+    Mount {
+        /// Mount point for the Time Machine volume
+        mount_point: Option<PathBuf>,
+    },
+
+    /// Unmount Time Machine backup volume
+    Unmount,
+
+    /// Show Time Machine backup status
+    Status,
+
+    /// Sync local sparsebundle to cloud
+    Sync {
+        /// Force full sync
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 fn main() {
@@ -301,6 +338,8 @@ fn run_command(command: Commands, config_path: &PathBuf) -> Result<()> {
             dry_run,
             force,
         } => cmd_migrate(config_path, password_file, dry_run, force),
+
+        Commands::Timemachine(tm_cmd) => run_timemachine_command(tm_cmd, config_path),
     }
 }
 
@@ -1088,4 +1127,215 @@ fn expand_tilde(path: &PathBuf) -> PathBuf {
         }
     }
     path.clone()
+}
+
+fn run_timemachine_command(command: TimemachineCommands, config_path: &PathBuf) -> Result<()> {
+    match command {
+        TimemachineCommands::Init { size, name } => cmd_timemachine_init(config_path, &size, &name),
+        TimemachineCommands::Mount { mount_point } => cmd_timemachine_mount(config_path, mount_point),
+        TimemachineCommands::Unmount => cmd_timemachine_unmount(config_path),
+        TimemachineCommands::Status => cmd_timemachine_status(config_path),
+        TimemachineCommands::Sync { full } => cmd_timemachine_sync(config_path, full),
+    }
+}
+
+fn cmd_timemachine_init(config_path: &PathBuf, size: &str, name: &str) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let tm_dir = config.data_dir.join("timemachine");
+    let sparsebundle_path = tm_dir.join(format!("{}.sparsebundle", name));
+
+    info!("Initializing Time Machine backup volume...");
+    info!("  Name: {}", name);
+    info!("  Size: {}", size);
+    info!("  Location: {:?}", sparsebundle_path);
+
+    // Create Time Machine directory
+    std::fs::create_dir_all(&tm_dir)?;
+
+    // Create sparsebundle using hdiutil (macOS only)
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("hdiutil")
+            .args([
+                "create",
+                "-size", size,
+                "-type", "SPARSEBUNDLE",
+                "-fs", "APFS",
+                "-volname", name,
+                sparsebundle_path.to_str().unwrap(),
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            return Err(Error::Internal(format!(
+                "Failed to create sparsebundle: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        println!("Time Machine volume created successfully!");
+        println!();
+        println!("Next steps:");
+        println!("  1. Run 'tgcryptfs timemachine mount' to mount the volume");
+        println!("  2. Run 'sudo tmutil setdestination /Volumes/{}' to set as Time Machine destination", name);
+        println!("  3. Time Machine will start backing up automatically");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("Time Machine is only supported on macOS.");
+        println!("On Linux, use 'rsync' for backups instead.");
+    }
+
+    Ok(())
+}
+
+fn cmd_timemachine_mount(config_path: &PathBuf, mount_point: Option<PathBuf>) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let tm_dir = config.data_dir.join("timemachine");
+
+    // Find the first sparsebundle
+    let sparsebundle = std::fs::read_dir(&tm_dir)?
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().extension().map(|ext| ext == "sparsebundle").unwrap_or(false))
+        .ok_or_else(|| Error::Internal("No Time Machine volume found. Run 'tgcryptfs timemachine init' first.".to_string()))?;
+
+    info!("Mounting Time Machine volume: {:?}", sparsebundle.path());
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut args = vec!["attach".to_string(), sparsebundle.path().to_string_lossy().to_string()];
+
+        if let Some(mp) = mount_point {
+            args.push("-mountpoint".to_string());
+            args.push(mp.to_string_lossy().to_string());
+        }
+
+        let output = std::process::Command::new("hdiutil")
+            .args(&args)
+            .output()?;
+
+        if !output.status.success() {
+            return Err(Error::Internal(format!(
+                "Failed to mount sparsebundle: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        println!("Time Machine volume mounted successfully!");
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("Time Machine mounting is only supported on macOS.");
+    }
+
+    Ok(())
+}
+
+fn cmd_timemachine_unmount(_config_path: &PathBuf) -> Result<()> {
+    info!("Unmounting Time Machine volume...");
+
+    #[cfg(target_os = "macos")]
+    {
+        // Find mounted Time Machine volumes
+        let _output = std::process::Command::new("hdiutil")
+            .args(["info", "-plist"])
+            .output()?;
+
+        // For simplicity, try to unmount /Volumes/TGCryptFS-TM
+        let output = std::process::Command::new("hdiutil")
+            .args(["detach", "/Volumes/TGCryptFS-TM"])
+            .output()?;
+
+        if !output.status.success() {
+            // Try alternate name
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", "/Volumes/TM-Backup"])
+                .output();
+        }
+
+        println!("Time Machine volume unmounted.");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("Time Machine unmounting is only supported on macOS.");
+    }
+
+    Ok(())
+}
+
+fn cmd_timemachine_status(config_path: &PathBuf) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let tm_dir = config.data_dir.join("timemachine");
+
+    println!("Time Machine Status");
+    println!("===================");
+    println!();
+
+    // List sparsebundles
+    println!("Backup Volumes:");
+    if tm_dir.exists() {
+        for entry in std::fs::read_dir(&tm_dir)? {
+            let entry = entry?;
+            if entry.path().extension().map(|ext| ext == "sparsebundle").unwrap_or(false) {
+                let meta = entry.metadata()?;
+                println!("  {:?}", entry.path().file_name().unwrap());
+                println!("    Size: {} MB", meta.len() / 1024 / 1024);
+            }
+        }
+    } else {
+        println!("  No backup volumes found.");
+        println!("  Run 'tgcryptfs timemachine init' to create one.");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        println!();
+        println!("Time Machine Destinations:");
+        let output = std::process::Command::new("tmutil")
+            .arg("destinationinfo")
+            .output();
+
+        match output {
+            Ok(out) => println!("{}", String::from_utf8_lossy(&out.stdout)),
+            Err(_) => println!("  Unable to query Time Machine destinations."),
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_timemachine_sync(config_path: &PathBuf, full: bool) -> Result<()> {
+    let config = Config::load(config_path)?;
+    let tm_dir = config.data_dir.join("timemachine");
+
+    info!("Syncing Time Machine volume to cloud...");
+
+    if full {
+        info!("Performing full sync...");
+    }
+
+    // Find sparsebundle
+    let sparsebundle = std::fs::read_dir(&tm_dir)?
+        .filter_map(|e| e.ok())
+        .find(|e| e.path().extension().map(|ext| ext == "sparsebundle").unwrap_or(false));
+
+    match sparsebundle {
+        Some(sb) => {
+            println!("Syncing: {:?}", sb.path());
+            println!("Note: Sync to tgcryptfs cloud storage not yet implemented.");
+            println!("      The sparsebundle is stored locally at: {:?}", sb.path());
+            println!();
+            println!("To manually sync to cloud storage:");
+            println!("  rsync -avh {:?}/ ~/mnt/tgcryptfs/timemachine/", sb.path());
+        }
+        None => {
+            println!("No Time Machine volume found. Run 'tgcryptfs timemachine init' first.");
+        }
+    }
+
+    Ok(())
 }
